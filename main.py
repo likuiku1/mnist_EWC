@@ -2,169 +2,224 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torchvision import datasets, transforms
-from torch.utils.data import DataLoader, Subset
+from torch.utils.data import DataLoader, TensorDataset
 import numpy as np
 
-# ================== 超参数设置 ==================
-config = {
-    'num_epochs': 3,  # 每个任务训练轮数
-    'batch_size': 64,
-    'lr': 1e-3,  # 学习率
-    'lambda': 1000,  # EWC正则化系数
-    'fisher_sample': 200,  # 计算Fisher信息的采样数
-    'device': 'cuda' if torch.cuda.is_available() else 'cpu'
-}
-
-
-# ================== 数据准备 ==================
-def prepare_tasks():
-    """创建两个连续的学习任务（MNIST数字分类）"""
-    transform = transforms.Compose([
-        transforms.ToTensor(),
-        transforms.Normalize((0.1307,), (0.3081,))
-    ])
-
-    # 任务1：数字0-4
-    full_dataset = datasets.MNIST('./data', train=True, download=True, transform=transform)
-    task1_indices = [i for i, (_, label) in enumerate(full_dataset) if label < 5]
-    task1_dataset = Subset(full_dataset, task1_indices)
-
-    # 任务2：数字5-9
-    task2_indices = [i for i, (_, label) in enumerate(full_dataset) if label >= 5]
-    task2_dataset = Subset(full_dataset, task2_indices)
-
-    return {
-        'task1': DataLoader(task1_dataset, batch_size=config['batch_size'], shuffle=True),
-        'task2': DataLoader(task2_dataset, batch_size=config['batch_size'], shuffle=True)
-    }
-
-
-# ================== 模型定义 ==================
-class ContinualModel(nn.Module):
+# ========== 网络结构 ==========
+class MLP(nn.Module):
     def __init__(self):
-        super().__init__()
-        self.feature_extractor = nn.Sequential(
+        super(MLP, self).__init__()
+        self.net = nn.Sequential(
+            nn.Flatten(),
             nn.Linear(28 * 28, 256),
             nn.ReLU(),
-            nn.Dropout(0.5)
+            nn.Linear(256, 256),
+            nn.ReLU(),
+            nn.Linear(256, 10)
         )
-        self.classifier = nn.Linear(256, 10)
 
     def forward(self, x):
-        x = x.view(-1, 28 * 28)
-        features = self.feature_extractor(x)
-        return self.classifier(features)
+        return self.net(x)
 
-
-# ================== EWC核心实现 ==================
-class EWC_Regularizer:
-    def __init__(self, model: nn.Module):
+# ========== EWC 实现 ==========
+class EWC:
+    def __init__(self, model, dataloader, device='cpu'):
         self.model = model
-        self.means = {}  # 旧任务参数均值
-        self.fisher = {}  # Fisher信息矩阵
+        self.device = device
+        self.params = {n: p.clone().detach() for n, p in self.model.named_parameters() if p.requires_grad}
+        self.fisher = self._compute_fisher(dataloader)
 
-    def calculate_fisher(self, dataloader):
-        """计算Fisher信息矩阵"""
-        fisher = {n: torch.zeros_like(p) for n, p in self.model.named_parameters()}
-
-        # 采样部分数据
-        indices = torch.randperm(len(dataloader.dataset))[:config['fisher_sample']]
-        subset = Subset(dataloader.dataset, indices)
-        temp_loader = DataLoader(subset, batch_size=config['batch_size'])
-
-        # 计算梯度平方期望
+    def _compute_fisher(self, dataloader):
+        fisher = {n: torch.zeros_like(p) for n, p in self.model.named_parameters() if p.requires_grad}
         self.model.eval()
-        for data, target in temp_loader:
-            data, target = data.to(config['device']), target.to(config['device'])
+        for data, target in dataloader:
+            data, target = data.to(self.device), target.to(self.device)
             self.model.zero_grad()
             output = self.model(data)
             loss = nn.functional.cross_entropy(output, target)
             loss.backward()
-
             for n, p in self.model.named_parameters():
-                if p.grad is not None:
-                    fisher[n] += p.grad.data.pow(2).mean(0) * len(data)
-
-        # 平均处理
+                if p.requires_grad:
+                    fisher[n] += p.grad.data.pow(2)
         for n in fisher:
-            fisher[n] /= len(subset)
-            self.fisher[n] = fisher[n].cpu()
+            fisher[n] /= len(dataloader)
+        return fisher
 
-    def penalty(self, model: nn.Module):
-        """计算EWC正则化项"""
+    def penalty(self, model):
         loss = 0
         for n, p in model.named_parameters():
-            if n in self.means:
-                loss += (self.fisher[n].to(config['device']) *
-                         (p - self.means[n].to(config['device'])).pow(2)).sum()
-        return config['lambda'] * loss
+            if p.requires_grad:
+                _loss = self.fisher[n] * (p - self.params[n]).pow(2)
+                loss += _loss.sum()
+        return loss
 
+# ========== GAN ==========
+class Generator(nn.Module):
+    def __init__(self, noise_dim=100):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(noise_dim, 128),
+            nn.ReLU(),
+            nn.Linear(128, 28 * 28),
+            nn.Tanh()
+        )
 
-# ================== 训练流程 ==================
-def train_task(model, optimizer, dataloader, ewc=None):
-    """单任务训练函数"""
+    def forward(self, z):
+        x = self.net(z)
+        return x.view(-1, 1, 28, 28)
+
+class Discriminator(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Flatten(),
+            nn.Linear(28 * 28, 128),
+            nn.LeakyReLU(0.2),
+            nn.Linear(128, 1),
+            nn.Sigmoid()
+        )
+
+    def forward(self, x):
+        return self.net(x)
+
+def train_gan(generator, discriminator, dataloader, device='cpu', epochs=5):
+    g_optimizer = optim.Adam(generator.parameters(), lr=0.0002)
+    d_optimizer = optim.Adam(discriminator.parameters(), lr=0.0002)
+    criterion = nn.BCELoss()
+
+    generator.train()
+    discriminator.train()
+    for epoch in range(epochs):
+        g_loss_total, d_loss_total = 0, 0
+        for real_data, _ in dataloader:
+            real_data = real_data.to(device)
+            batch_size = real_data.size(0)
+
+            # 训练判别器
+            z = torch.randn(batch_size, 100).to(device)
+            fake_data = generator(z).detach()
+            real_label = torch.ones(batch_size, 1).to(device)
+            fake_label = torch.zeros(batch_size, 1).to(device)
+
+            d_real = discriminator(real_data)
+            d_fake = discriminator(fake_data)
+            d_loss = criterion(d_real, real_label) + criterion(d_fake, fake_label)
+
+            d_optimizer.zero_grad()
+            d_loss.backward()
+            d_optimizer.step()
+
+            # 训练生成器
+            z = torch.randn(batch_size, 100).to(device)
+            fake_data = generator(z)
+            d_fake = discriminator(fake_data)
+            g_loss = criterion(d_fake, real_label)
+
+            g_optimizer.zero_grad()
+            g_loss.backward()
+            g_optimizer.step()
+
+            d_loss_total += d_loss.item()
+            g_loss_total += g_loss.item()
+
+        print(f"GAN Epoch {epoch+1} Loss: {g_loss_total:.4f}")
+
+# ========== FGSM 攻击 ==========
+class FGSM:
+    def __init__(self, model, epsilon=0.2):
+        self.model = model
+        self.epsilon = epsilon
+
+    def generate(self, x, y):
+        x_adv = x.clone().detach().requires_grad_(True)
+        output = self.model(x_adv)
+        loss = nn.functional.cross_entropy(output, y)
+        self.model.zero_grad()
+        loss.backward()
+        x_adv = x_adv + self.epsilon * x_adv.grad.sign()
+        return x_adv.detach()
+
+# ========== 训练与评估函数 ==========
+def train_task(model, optimizer, dataloader, ewc=None, lambda_ewc=1000, gan=None, use_gan=False, device='cpu'):
     model.train()
-    for epoch in range(config['num_epochs']):
+    criterion = nn.CrossEntropyLoss()
+    for epoch in range(5):
         total_loss = 0
-        for data, target in dataloader:
-            data, target = data.to(config['device']), target.to(config['device'])
+        for real_data, real_target in dataloader:
+            real_data, real_target = real_data.to(device), real_target.to(device)
+            if use_gan and gan is not None:
+                z = torch.randn(real_data.size(0), 100).to(device)
+                gen_data = gan(z)
+                gen_target = torch.randint(0, 10, (real_data.size(0),)).to(device)
+                data = torch.cat([real_data, gen_data])
+                target = torch.cat([real_target, gen_target])
+            else:
+                data, target = real_data, real_target
 
             optimizer.zero_grad()
             output = model(data)
-            loss = nn.functional.cross_entropy(output, target)
-
-            # 添加EWC正则项
-            if ewc is not None:
-                loss += ewc.penalty(model)
-
+            loss = criterion(output, target)
+            if ewc:
+                loss += lambda_ewc * ewc.penalty(model)
             loss.backward()
             optimizer.step()
             total_loss += loss.item()
+        print(f"Epoch {epoch+1} Loss: {total_loss:.4f}")
 
-        print(f'Epoch {epoch + 1} Loss: {total_loss / len(dataloader):.4f}')
-
-
-def evaluate(model, dataloader):
-    """模型评估函数"""
+def evaluate(model, dataloader, adversarial=False, attack=None, device='cpu'):
     model.eval()
-    correct = 0
-    with torch.no_grad():
-        for data, target in dataloader:
-            data, target = data.to(config['device']), target.to(config['device'])
+    correct, total = 0, 0
+    for data, target in dataloader:
+        data, target = data.to(device), target.to(device)
+        if adversarial and attack is not None:
+            data = attack.generate(data, target)
+        with torch.no_grad():
             output = model(data)
             pred = output.argmax(dim=1)
-            correct += pred.eq(target).sum().item()
-    accuracy = 100. * correct / len(dataloader.dataset)
-    return accuracy
+        correct += (pred == target).sum().item()
+        total += target.size(0)
+    return correct / total * 100
 
+# ========== 主程序 ==========
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-# ================== 主流程 ==================
-if __name__ == "__main__":
-    # 初始化模型和优化器
-    model = ContinualModel().to(config['device'])
-    optimizer = optim.Adam(model.parameters(), lr=config['lr'])
+# 加载数据
+transform = transforms.Compose([transforms.ToTensor()])
+task1_data = datasets.MNIST('.', train=True, download=True, transform=transform)
+task2_data = datasets.MNIST('.', train=False, transform=transform)
 
-    # 准备任务数据
-    loaders = prepare_tasks()
+task1_loader = DataLoader(task1_data, batch_size=64, shuffle=True)
+task2_loader = DataLoader(task2_data, batch_size=64, shuffle=True)
 
-    # 阶段1：训练任务1 (数字0-4)
-    print("==== Training Task 1 ====")
-    train_task(model, optimizer, loaders['task1'])
-    task1_acc = evaluate(model, loaders['task1'])
-    print(f"Task1 Accuracy: {task1_acc:.2f}%")
+# 初始化模型
+model = MLP().to(device)
+optimizer = optim.Adam(model.parameters(), lr=0.001)
 
-    # 计算Fisher信息并保存参数
-    ewc = EWC_Regularizer(model)
-    ewc.calculate_fisher(loaders['task1'])
-    ewc.means = {n: p.clone().detach().cpu() for n, p in model.named_parameters()}
+print("=== Training Task1 ===")
+train_task(model, optimizer, task1_loader, device=device)
+acc_task1 = evaluate(model, task1_loader, device=device)
+print(f"Task1 Initial Acc: {acc_task1:.2f}%")
 
-    # 阶段2：训练任务2 (数字5-9) 应用EWC
-    print("\n==== Training Task 2 with EWC ====")
-    train_task(model, optimizer, loaders['task2'], ewc=ewc)
+# EWC
+ewc = EWC(model, task1_loader, device=device)
 
-    # 最终评估
-    print("\n==== Final Evaluation ====")
-    task1_final_acc = evaluate(model, loaders['task1'])
-    task2_acc = evaluate(model, loaders['task2'])
-    print(f"Task1 Forget Rate: {task1_acc - task1_final_acc:.2f}%")
-    print(f"Task2 Accuracy: {task2_acc:.2f}%")
+# 训练 GAN
+print("\n=== Training GAN on Task1 ===")
+generator = Generator().to(device)
+discriminator = Discriminator().to(device)
+train_gan(generator, discriminator, task1_loader, device=device)
+
+# 任务2训练
+print("\n=== Continual Learning Task2 ===")
+train_task(model, optimizer, task2_loader, ewc=ewc, use_gan=True, gan=generator, device=device)
+acc_task2 = evaluate(model, task2_loader, device=device)
+
+# 对抗评估
+attack = FGSM(model, epsilon=0.2)
+adv_acc = evaluate(model, task1_loader, adversarial=True, attack=attack, device=device)
+
+# 最终评估
+print("\n==== Final Evaluation ====")
+print(f"Task1 Forget Rate: {acc_task1 - evaluate(model, task1_loader, device=device):.2f}%")
+print(f"Task2 Accuracy: {acc_task2:.2f}%")
+print(f"Adversarial Accuracy on Task1: {adv_acc:.2f}%")
